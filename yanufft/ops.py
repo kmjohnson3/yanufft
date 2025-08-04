@@ -8,13 +8,12 @@ from torch import Tensor
 import math
 
 __all__ = [
-    "centered_fft",
-    "centered_ifft",
     "nufft",
     "nufft_adjoint",
     "NUFFT",
     "NUFFTadjoint",
     "Nufft_op3D",
+    "Gridding",
     "estimate_shape",
     "nufft_gridding", 
     "nufft_interpolation"
@@ -22,11 +21,43 @@ __all__ = [
 
 
 def nufft_gridding(input: Tensor, coord: Tensor, os_shape: Tensor, width: float, beta: float, chop: bool) -> Tensor:
-    return torch.ops.yanufft.nufft_gridding.default(input, coord, os_shape, width, beta, chop)
 
+    if( input.dtype == torch.complex64 or input.dtype == torch.complex128):
+        # Call the C++ or CUDA backend for gridding
+        return torch.ops.yanufft.nufft_gridding.default(input, coord, os_shape, width, beta, chop)
+    elif input.dtype == torch.float32 or input.dtype == torch.float64:
+        # Cast to complex if not already
+        input = input.to(torch.complex64)
+        
+        # Run the gridding operation (this will call the C++ or CUDA backend)
+        output = torch.ops.yanufft.nufft_gridding.default(input, coord, os_shape, width, beta, chop)
+        
+        # Convert back to float if needed
+        if output.dtype == torch.complex64:
+            output = output.real
+        return output
+    else:
+        raise TypeError("Unsupported input type. Expected complex or float tensors.")
+    
 
 def nufft_interpolation(input: Tensor, coords: Tensor, width: float, beta: float, chop: bool) -> Tensor:
-    return torch.ops.yanufft.nufft_interpolation.default(input, coords, width, beta, chop)
+
+    if input.dtype == torch.complex64 or input.dtype == torch.complex128:
+        # Call the C++ or CUDA backend for interpolation
+        return torch.ops.yanufft.nufft_interpolation.default(input, coords, width, beta, chop)
+    elif input.dtype == torch.float32 or input.dtype == torch.float64:
+        # Cast to complex if not already
+        input = input.to(torch.complex64)
+        
+        # Run the interpolation operation (this will call the C++ or CUDA backend)
+        output = torch.ops.yanufft.nufft_interpolation.default(input, coords, width, beta, chop)
+        
+        # Convert back to float if needed
+        if output.dtype == torch.complex64:
+            output = output.real
+        return output
+    else:
+        raise TypeError("Unsupported input type. Expected complex or float tensors.")
 
 
 def centered_fft(input: Tensor, s=None, dim= None, norm: str = "ortho") -> Tensor:
@@ -36,7 +67,7 @@ def centered_fft(input: Tensor, s=None, dim= None, norm: str = "ortho") -> Tenso
         input (array): input array.
         s (None or array of ints): output shape.
         dim (None or array of ints): Axes over which to compute the FFT.
-        norm (Nonr or ``"ortho"``): Keyword to specify the normalization mode.
+        norm (None or ``"ortho"``): Keyword to specify the normalization mode.
 
     Returns:
         array: FFT result of dimension oshape.
@@ -56,7 +87,7 @@ def standard_fft(input, s=None, dim=None, norm="ortho"):
         input (array): input array.
         s (None or array of ints): output shape.
         dim (None or array of ints): Axes over which to compute the FFT.
-        norm (Nonr or ``"ortho"``): Keyword to specify the normalization mode.
+        norm (None or ``"ortho"``): Keyword to specify the normalization mode.
 
     Returns:
         array: FFT result of dimension oshape.
@@ -72,7 +103,7 @@ def centered_ifft(input, s=None, dim=None, norm="ortho"):
         input (array): input array.
         s (None or array of ints): output shape.
         dim (None or array of ints): Axes over which to compute the FFT.
-        norm (Nonr or ``"ortho"``): Keyword to specify the normalization mode.
+        norm (None or ``"ortho"``): Keyword to specify the normalization mode.
 
     Returns:
         array: FFT result of dimension oshape.
@@ -92,7 +123,7 @@ def standard_ifft(input, s=None, dim=None, norm="ortho"):
         input (array): input array.
         s (None or array of ints): output shape.
         dim (None or array of ints): Axes over which to compute the FFT.
-        norm (Nonr or ``"ortho"``): Keyword to specify the normalization mode.
+        norm (None or ``"ortho"``): Keyword to specify the normalization mode.
 
     Returns:
         array: FFT result of dimension oshape.
@@ -141,11 +172,12 @@ def nufft(input, coord, oversamp=1.25, width=4):
     _apodize(output, ndim, oversamp, width, beta, True)
 
     # Zero-pad
+    output /= torch.prod(torch.tensor(input.shape[-ndim:])) ** 0.5
     output = _zeropad(output, os_shape)
 
     # FFT
     dim = [d for d in range(-ndim,0)]
-    output = standard_fft(output, dim=dim)
+    output = standard_fft(output, dim=dim, norm=None)
 
     # Interpolate
     coord = _scale_coord(coord, input.shape, oversamp,)
@@ -302,11 +334,12 @@ def nufft_adjoint(input, coord, oshape=None, oversamp=1.25, width=4):
 
     # IFFT
     dim = [d for d in range(-ndim, 0)]
-    output = standard_ifft(output, dim=dim)
+    output = standard_ifft(output, dim=dim, norm=None)
 
     # Crop
     output = _crop(output, oshape)
-    
+    output *= torch.prod(torch.tensor(os_shape[-ndim:])) / torch.prod(torch.tensor(oshape[-ndim:])) ** 0.5
+
     # Apodize
     _apodize(output, ndim, oversamp, width, beta, True)
 
@@ -346,9 +379,47 @@ def _apodize(input, ndim, oversamp, width, beta, chop=False):
         if chop:
             apod[::2] *= -1
 
+        ## Kernel is normalized to 1 in gridding/interpolation
+        #apod /= apod.abs().max()
+
         output *= apod.reshape([i] + [1] * (-a - 1))
 
     return output
+
+
+class Gridding(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input, coord, os_shape, width, beta):
+        """
+        :param input: Tensor (total pts,) 
+        :param coord: Tensor (total pts, ndim)
+        :param os_shape: Tensor (ndim) output shape
+        :param width: float. kernel width
+        :param beta: float. beta parameter for the kernel
+        :param chop: bool. whether to apply chopping
+        :return: output, tensor of (xres, yres, zres) 
+        """
+        ctx.save_for_backward(coord)
+        ctx.width = width
+        ctx.beta = beta
+
+        # Call the C++ or CUDA backend for gridding
+        output = nufft_gridding(input, coord, os_shape, width, beta, False)
+        
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+
+        # Unpack saved tensors
+        coord, = ctx.saved_tensors
+        width = ctx.width
+        beta = ctx.beta
+
+        # Gradient of coordinates
+        grad_input = nufft_interpolation(grad_output, coord, width, beta, False)
+
+        return grad_input, None, None, None, None
 
 class NUFFT(torch.autograd.Function):
     @staticmethod
@@ -361,7 +432,11 @@ class NUFFT(torch.autograd.Function):
         :return: kdata, tensor of (c, total pts) on gpu
         """
         ctx.save_for_backward(coord, im, smaps)
+        
+        # Create the operator
         A = Nufft_op3D(smaps, coord)
+
+        # Apply forward NUFFT
         output = A.forward(im)
 
         return output
@@ -370,9 +445,17 @@ class NUFFT(torch.autograd.Function):
     def backward(ctx, *grad_outputs):
         grad_output, = grad_outputs
         #print(f'grad_output shape {grad_output.shape}')
+        
+        # Unpack saved tensors
         coord, im, smaps = ctx.saved_tensors
+
+        # Create the operator
         A = Nufft_op3D(smaps, coord)
+
+        # Gradient coordinates
         grad_input = A.backward_forward(im, grad_output)
+        
+        # Gradient of image
         grad_input_im = A.adjoint(grad_output)
         
         return grad_input, grad_input_im, None
@@ -382,7 +465,11 @@ class NUFFTadjoint(torch.autograd.Function):
     @staticmethod
     def forward(ctx, coord, y, smaps):
         ctx.save_for_backward(coord, y, smaps)
+        
+        # NUFFT Operators
         A = Nufft_op3D(smaps, coord)
+
+        # Adjoint NUFFT
         output = A.adjoint(y)
         return output
     
@@ -390,10 +477,17 @@ class NUFFTadjoint(torch.autograd.Function):
     def backward(ctx, *grad_outputs):
         grad_output, = grad_outputs
         #print(f'grad_output shape {grad_output.shape}')
-        coord, y, smaps = ctx.saved_tensors
-        A = Nufft_op3D(smaps, coord)
         
+        # Get saved tensors
+        coord, y, smaps = ctx.saved_tensors
+
+        # NUFFT Operators
+        A = Nufft_op3D(smaps, coord)
+
+        # Gradient of coordinates        
         grad_input = A.backward_adjoint(y, grad_output)      # (klength, 2)
+        
+        # Gradient of k-space
         grad_input_y = A.forward(grad_output)
         
         return grad_input, grad_input_y, None
@@ -422,7 +516,7 @@ class Nufft_op3D():
             self.xx = torch.arange(self.nx, dtype=self.torch_dtype, device=smaps.device) - self.nx / 2.
             self.xy = torch.arange(self.ny, dtype=self.torch_dtype, device=smaps.device) - self.ny / 2.
             self.xz = torch.arange(self.nz, dtype=self.torch_dtype, device=smaps.device) - self.nz / 2.
-            self.XX, self.XY, self.XZ = torch.meshgrid(self.xx, self.xy, self.xz)
+            self.XX, self.XY, self.XZ = torch.meshgrid(self.xx, self.xy, self.xz, indexing='ij')
 
     def forward(self, im: Tensor) -> Tensor:
         
@@ -431,16 +525,14 @@ class Nufft_op3D():
         for coil in range(self.ncoils):
             y.append(nufft(self.smaps[coil]*im, self.coord))
         y = torch.stack(y, dim=0)
-        #print(f'forward: y shape {y.shape}')  # torch.Size([ncoils, total pts])
+        
         return y
 
     def adjoint(self, y: Tensor)-> Tensor:
-        # ff = nufft_adjoint(y[0], self.coord, oshape=self.image_shape)
-        #print(f'adjoint: ff shape {ff.shape}')  # torch.Size([256, 256, 256])
-        #print(f'smaps shape {self.smaps[0].shape}')  # torch.Size([1, 256, 256, 256])
 
+        # Create adjoint image for each coil
         im = nufft_adjoint(y[0], self.coord, oshape=self.image_shape)*torch.conj(self.smaps[0])
-        for coil in range(1,self.ncoils-1):
+        for coil in range(1,self.ncoils):
             im += nufft_adjoint(y[coil],self.coord, oshape=self.image_shape)*torch.conj(self.smaps[coil])
      
         return im
@@ -477,16 +569,17 @@ class Nufft_op3D():
         else:
             # Gradient with respect to the coordinates
             grad = torch.zeros(self.coord.shape, dtype=self.torch_dtype, device=y.device)
-
-            vecx_grad_output = torch.mul(self.XX, g)
-            vecy_grad_output = torch.mul(self.XY, g)
-            vecz_grad_output = torch.mul(self.XZ, g)
-
+            
             # CT 03/2023 implementation of Guanhua's paper. See original nufftbindings for Alban's method
+            vecx_grad_output = torch.mul(self.XX, g)
             tmp = self.forward(vecx_grad_output)
             grad[:, 0] = ((tmp.mul_(torch.conj(y) * (0 - 1j))).real * 2).sum(axis=0)
+            
+            vecy_grad_output = torch.mul(self.XY, g)
             tmp = self.forward(vecy_grad_output)
             grad[:, 1] = ((tmp.mul_(torch.conj(y) * (0 - 1j))).real * 2).sum(axis=0)
+
+            vecz_grad_output = torch.mul(self.XZ, g)
             tmp = self.forward(vecz_grad_output)
             grad[:, 2] = ((tmp.mul_(torch.conj(y) * (0 - 1j))).real * 2).sum(axis=0)
 

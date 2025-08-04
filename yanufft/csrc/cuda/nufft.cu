@@ -26,35 +26,35 @@ __host__ __device__ __forceinline__ float kaiser_bessel_kernel_1d(float x, float
         return 0.0f;
     }
 
-    x = fabs(x);
     x = beta * sqrtf(1 - x * x);
+    auto t = x / 3.75;
     
     if (x < 3.75f) {
-        auto t =  x / 3.75f;
         t = t * t;
         return (
-            1.0 +
-            t * (3.5156229 +
-            t * (3.0899424 +
-            t * (1.2067492 +
-            t * (0.2659732 + 
-            t * (0.360768e-1 + 
-            t * 0.45813e-2)))))
+            1
+            + 3.5156229 * t
+            + 3.0899424 * t * t
+            + 1.2067492 * t * t * t
+            + 0.2659732 * t * t * t * t
+            + 0.0360768 * t * t * t * t * t
+            + 0.0045813 * t * t * t * t * t * t
         );
     } else {
-        auto t =  3.75f / x;
-
         return (
-            (expf(x) / sqrtf(x)) *
-            0.39894228 +
-            t * (0.1328592e-1 +
-            t * (0.225319e-2 +
-            t * (-0.157565e-2 +
-            t * (0.916281e-2 +
-            t * (-0.2057706e-1 +
-            t * (0.2635537e-1 +
-            t * (-0.1647633e-1 +
-            t * 0.392377e-2)))))))
+            powf(x, -0.5)
+            * expf(x)
+            * (
+                0.39894228
+                + 0.01328592 * powf(t, -1)
+                + 0.00225319 * powf(t, -2)
+                - 0.00157565 * powf(t, -3)
+                + 0.00916281 * powf(t, -4)
+                - 0.02057706 * powf(t, -5)
+                + 0.02635537 * powf(t, -6)
+                - 0.01647633 * powf(t, -7)
+                + 0.00392377 * powf(t, -8)
+            )
         );
     }
 }
@@ -240,6 +240,7 @@ at::Tensor nufft_gridding_cuda(
         kernel_norm += 0.02*kaiser_bessel_kernel_1d(k, beta);
     }
     kernel_norm = 1.0 / ( kernel_norm * kernel_norm * kernel_norm * half_width_z * half_width_y * half_width_x );
+    kernel_norm = 1.0 / (8.0*half_width_x * half_width_y * half_width_z);
 
     // Launch the kernel    
     gridding_kernel_3d<<<blocks, threads>>>(
@@ -300,6 +301,7 @@ at::Tensor nufft_interpolation_cuda(
         kernel_norm += 0.02*kaiser_bessel_kernel_1d(k, beta);
     }
     kernel_norm = 1.0 / ( kernel_norm * kernel_norm * kernel_norm * half_width_z * half_width_y * half_width_x );
+    kernel_norm = 1.0 / (8.0*half_width_x * half_width_y * half_width_z);
 
     // Launch the kernel    
     interpolation_kernel_3d<<<blocks, threads>>>(
