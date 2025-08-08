@@ -14,6 +14,7 @@ __all__ = [
     "NUFFTadjoint",
     "Nufft_op3D",
     "Gridding",
+    "Interpolation",
     "estimate_shape",
     "nufft_gridding", 
     "nufft_interpolation"
@@ -420,6 +421,44 @@ class Gridding(torch.autograd.Function):
         grad_input = nufft_interpolation(grad_output, coord, width, beta, False)
 
         return grad_input, None, None, None, None
+
+
+class Interpolation(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input, coord, width, beta):
+        """
+        :param input: Tensor (total pts,) 
+        :param coord: Tensor (total pts, ndim)
+        :param os_shape: Tensor (ndim) output shape
+        :param width: float. kernel width
+        :param beta: float. beta parameter for the kernel
+        :param chop: bool. whether to apply chopping
+        :return: output, tensor of (xres, yres, zres) 
+        """
+        ctx.save_for_backward(coord)
+        ctx.width = width
+        ctx.beta = beta
+        ctx.os_shape = input.shape[-coord.shape[-1]:]  # Save the output shape
+
+        # Forward pass
+        output = nufft_interpolation(input, coord, width, beta, False)
+
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+
+        # Unpack saved tensors
+        coord, = ctx.saved_tensors
+        width = ctx.width
+        beta = ctx.beta
+        os_shape = ctx.os_shape
+
+        # Call the C++ or CUDA backend for gridding
+        grad_input = nufft_gridding(grad_output, coord, os_shape, width, beta, False)
+        
+        return grad_input, None, None, None, None
+    
 
 class NUFFT(torch.autograd.Function):
     @staticmethod
